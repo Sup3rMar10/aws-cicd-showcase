@@ -1,0 +1,95 @@
+name: Deploy
+
+# Manual for now: run it from the Actions tab after scripts/bootstrap.sh has created the AWS roles.
+# To deploy on every push to main instead, add this under `on:` (and keep workflow_dispatch):
+#   push:
+#     branches: [main]
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false # never interrupt a half-finished apply
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions: # a reusable workflow cannot get more permissions than its caller grants
+      id-token: write
+      contents: read
+
+  deploy:
+    name: Build, push, apply, verify
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: prod # the role's trust policy only accepts tokens from this environment; add required reviewers for approval
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      NAME: aws-cicd-showcase
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+
+      - name: Terraform init (remote state in S3, native locking)
+        working-directory: infra
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${NAME}/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      # The service cannot start before its image exists, so create the registry first (a no-op after the first run).
+      - name: Ensure the ECR repository exists
+        working-directory: infra
+        run: terraform apply -input=false -auto-approve -target=aws_ecr_repository.app -var "image_tag=${{ github.sha }}"
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the image, tagged with the git SHA
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          image="${REGISTRY}/${NAME}:${GITHUB_SHA}"
+          # Tags are immutable in ECR, so a re-run of the same commit reuses the image that is already there.
+          if aws ecr describe-images --repository-name "$NAME" --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "image $GITHUB_SHA already in ECR, skipping push"
+          else
+            docker build --build-arg APP_VERSION="$GITHUB_SHA" -t "$image" app
+            docker push "$image"
+          fi
+
+      - name: Terraform apply
+        working-directory: infra
+        run: terraform apply -input=false -auto-approve -lock-timeout=300s -var "image_tag=${{ github.sha }}"
+
+      - name: Wait for the ECS service to settle
+        run: aws ecs wait services-stable --cluster "$NAME" --services "$NAME"
+
+      - name: Smoke test (the running version must be this commit)
+        working-directory: infra
+        run: |
+          url=$(terraform output -raw url)
+          echo "url=$url" >> "$GITHUB_STEP_SUMMARY"
+          ../scripts/smoke.sh "$url" "${{ github.sha }}"
+
+      - name: Show service events on failure
+        if: failure()
+        run: |
+          aws ecs describe-services --cluster "$NAME" --services "$NAME" \
+            --query 'services[0].events[:10].[createdAt,message]' --output text || true

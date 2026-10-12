@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call: # reused by deploy.yml so a deploy is gated by the exact same checks
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: Lint, test, build, scan the image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - name: Unit tests and IAM policy checks
+        run: pytest -q
+      - run: docker build -t aws-cicd-showcase:ci app
+      - name: Scan the image for known vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: aws-cicd-showcase:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  terraform-check:
+    name: Terraform fmt, validate and credential-free plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+      - run: terraform fmt -check -recursive
+        working-directory: infra
+      - run: terraform init -backend=false -input=false
+        working-directory: infra
+      - run: terraform validate
+        working-directory: infra
+      - name: Offline plan (no AWS account, no remote state, no API calls)
+        run: scripts/offline_plan.sh
+
+  iac-security:
+    name: IaC misconfiguration scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+  plan:
+    name: Terraform plan against AWS (shown on the pull request)
+    # Only runs once bootstrap.sh has created the roles and set the repository variables.
+    if: github.event_name == 'pull_request' && vars.AWS_PLAN_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # request the OIDC token that AWS exchanges for short-lived credentials
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=aws-cicd-showcase/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+      - name: Terraform plan
+        working-directory: infra
+        run: |
+          terraform plan -input=false -no-color -lock-timeout=60s -var "image_tag=${{ github.sha }}" | tee plan.txt
+          { echo '### Terraform plan'; echo '```'; tail -n 60 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
