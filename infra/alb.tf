@@ -1,3 +1,5 @@
+# Accepted risk: this is a public web service, so the load balancer is internet-facing on purpose.
+#trivy:ignore:AVD-AWS-0053
 resource "aws_lb" "app" {
   name                       = var.name
   load_balancer_type         = "application"
@@ -23,6 +25,9 @@ resource "aws_lb_target_group" "app" {
   }
 }
 
+# Accepted risk: the demo has no domain name, so there is no TLS certificate to attach. For a real service, add an ACM
+# certificate, an HTTPS listener on 443 and turn this listener into a redirect to it.
+#trivy:ignore:AVD-AWS-0054
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.app.arn
   port              = 80

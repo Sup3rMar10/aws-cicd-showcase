@@ -79,6 +79,10 @@ resource "aws_vpc_security_group_ingress_rule" "tasks_from_alb" {
   referenced_security_group_id = aws_security_group.alb.id
 }
 
+# Accepted risk: tasks sit in public subnets (no NAT gateway, to avoid its hourly cost) and must reach ECR and CloudWatch
+# Logs, whose endpoints are public addresses. The rule is limited to port 443. Production would use private subnets
+# with VPC endpoints and restrict egress to them.
+#trivy:ignore:AVD-AWS-0104
 resource "aws_vpc_security_group_egress_rule" "tasks_out" {
   security_group_id = aws_security_group.tasks.id
   description       = "HTTPS out, for ECR image pulls and CloudWatch Logs"
